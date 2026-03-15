@@ -1965,6 +1965,132 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="helion_gdn_fwd_h",
         )
 
+    def test_qwen3_5_2b_rms_norm(self) -> None:
+        """Test the RMSNorm kernel from qwen3_5_2b."""
+        hidden_size = 256
+        args = (
+            torch.randn([64, hidden_size], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([hidden_size], device=DEVICE, dtype=HALF_DTYPE),
+            1e-6,
+        )
+        expected = torch.nn.functional.rms_norm(
+            args[0].float(), (hidden_size,), args[1].float(), eps=args[2]
+        ).to(HALF_DTYPE)
+        check_example(
+            "qwen3_5_2b",
+            args,
+            expected,
+            fn_name="rms_norm",
+            block_sizes=[16],
+        )
+
+    def test_qwen3_5_2b_swiglu(self) -> None:
+        """Test the SwiGLU activation kernel from qwen3_5_2b."""
+        args = (
+            torch.randn([64, 256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 256], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        check_example(
+            "qwen3_5_2b",
+            args,
+            F.silu(args[0]) * args[1],
+            fn_name="swiglu_fwd",
+            block_sizes=[1024],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRefEager("Decoder block test requires compiled kernels")
+    def test_qwen3_5_2b_decoder_block(self) -> None:
+        """Test the complete Qwen 3.5 2B decoder block against PyTorch reference."""
+        mod = import_path(EXAMPLES_DIR / "qwen3_5_2b.py")
+
+        # Use a mini config so the test runs quickly on any GPU
+        config = mod.Qwen35Config(
+            hidden_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-6,
+            rope_theta=1_000_000.0,
+            max_position_embeddings=128,
+        )
+        batch_size = 2
+        seq_len = 16
+        device = DEVICE
+        dtype = HALF_DTYPE
+
+        # Shared weights
+        weights = mod._make_weights(config, device, dtype)
+
+        # Reference module (PyTorch)
+        ref = mod.Qwen35DecoderBlockReference(config).to(device=device, dtype=dtype)
+        mod._copy_weights_to_reference(ref, weights)
+
+        # Precompute RoPE tables
+        cos, sin = mod.precompute_rope_cos_sin(
+            seq_len=seq_len,
+            head_dim=config.head_dim,
+            rope_theta=config.rope_theta,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Input hidden states
+        hidden_states = torch.randn(
+            batch_size * seq_len, config.hidden_size, device=device, dtype=dtype
+        )
+
+        # Run Helion decoder block
+        helion_out = mod.qwen_decoder_block(
+            hidden_states=hidden_states,
+            attn_norm_weight=weights["attn_norm_weight"],
+            q_proj_weight=weights["q_proj_weight"],
+            k_proj_weight=weights["k_proj_weight"],
+            v_proj_weight=weights["v_proj_weight"],
+            o_proj_weight=weights["o_proj_weight"],
+            ffn_norm_weight=weights["ffn_norm_weight"],
+            gate_proj_weight=weights["gate_proj_weight"],
+            up_proj_weight=weights["up_proj_weight"],
+            down_proj_weight=weights["down_proj_weight"],
+            cos=cos,
+            sin=sin,
+            config=config,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+
+        # Run PyTorch reference
+        ref_out = ref(hidden_states, cos, sin, batch_size, seq_len)
+
+        torch.testing.assert_close(helion_out, ref_out, rtol=1e-2, atol=1e-1)
+
+    def test_qwen3_5_2b_gqa_attention(self) -> None:
+        """Test the GQA attention kernel from qwen3_5_2b with causal masking."""
+        # Use a small but representative shape: 2 batches * 4 heads, seq=32, head_dim=64
+        bh, seq_len, head_dim = 8, 32, 64
+        q = torch.randn([bh, seq_len, head_dim], device=DEVICE, dtype=HALF_DTYPE)
+        k = torch.randn([bh, seq_len, head_dim], device=DEVICE, dtype=HALF_DTYPE)
+        v = torch.randn([bh, seq_len, head_dim], device=DEVICE, dtype=HALF_DTYPE)
+
+        # Reference: PyTorch SDPA with causal mask
+        # Reshape to [1, bh, seq, head_dim] for SDPA
+        expected = F.scaled_dot_product_attention(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            is_causal=True,
+        ).squeeze(0)
+
+        check_example(
+            "qwen3_5_2b",
+            (q, k, v),
+            expected,
+            fn_name="gqa_attention",
+            block_sizes=[1, 32, 32],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
