@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -10,6 +11,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 
@@ -75,6 +77,40 @@ def pallas_affine_scalar_args(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_matmul_broadcast_bias(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], device=x.device, dtype=torch.promote_types(x.dtype, y.dtype)
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc + bias[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    b, m, k = A.size()
+    b, k, n = B.size()
+    out = torch.empty(
+        [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
+    )
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sum_reduction(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
@@ -135,6 +171,63 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_attention(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            k = k_view[tile_b, :, tile_n]
+            qk = torch.bmm(q, k)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        m_i += torch.log2(l_i)
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
+    """Softmax over a non-power-of-2 reduction dim.
+
+    Uses amax + exp + sum which forces explicit index/mask generation,
+    exercising the RDIM_SIZE code path.
+    """
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row = x[tile_n, :]
+        max_val = torch.amax(row, dim=-1, keepdim=True)
+        exp_val = torch.exp(row - max_val)
+        out[tile_n, :] = exp_val / torch.sum(exp_val, dim=-1, keepdim=True)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -147,6 +240,27 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_add_does_not_donate_inputs(self) -> None:
+        """Verify that read-only inputs are not donated by the kernel.
+
+        Regression test: the codegen used to mark all tensor args as outputs
+        (including read-only inputs rebound by broadcast_tensors), causing JAX
+        to donate their buffers.  Any external reference to the inputs would
+        then fail with "Buffer has been deleted or donated".
+        """
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        # Save copies to compare against after the kernel call.
+        x_copy = x.clone()
+        y_copy = y.clone()
+        code, result = code_and_output(add_kernel, (x, y), block_size=256)
+        torch.testing.assert_close(result, x_copy + y_copy)
+        # Only the output (index 2) should be in _output_indices, not inputs.
+        self.assertIn("_output_indices=[2]", code)
+        # The original inputs must still be accessible (not donated).
+        torch.testing.assert_close(x, x_copy)
+        torch.testing.assert_close(y, y_copy)
 
     def test_add_2d(self) -> None:
         args = (
@@ -271,6 +385,39 @@ class TestPallas(TestCase):
         self.assertIn("for ", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_matmul_broadcast_bias(self) -> None:
+        """Regression: bias [1, N] must not iterate grid dim 0.
+
+        Without the dim_size <= block_size guard in _compute_block_spec_info,
+        the bias BlockSpec maps grid dim i to its 1-row axis, causing an
+        out-of-bounds DMA read that crashes the TPU.
+        """
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 1024, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_matmul_broadcast_bias, (x, y, bias), block_sizes=[64, 128, 128]
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        # The bias block_spec_info must have None for dim 0 (not a grid index).
+        self.assertIn("(None, 1)", code)
+
+    def test_bmm(self) -> None:
+        """Test BMM with default config — exercises size_matches fix.
+
+        Without the size_matches fix, adjust_block_size_constraints cannot
+        match block dims to tensor dims (4 block dims vs 3D tensors), causing
+        the default config to pick block sizes that violate TPU alignment.
+        """
+        a = torch.randn(4, 128, 256, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
+        # No explicit block_sizes — uses default_config() which runs
+        # adjust_block_size_constraints and depends on size_matches.
+        code, result = code_and_output(pallas_bmm, (a, b))
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
         args = (
@@ -303,6 +450,103 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         self.assertNotIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_attention_default_fp32(self) -> None:
+        """Test attention with default (for-loop) inner loop."""
+        query = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 4, 32, 64, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        _code, result = code_and_output(pallas_attention, args, block_sizes=[1, 32, 32])
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_emit_pipeline_correctness(self) -> None:
+        """Test emit_pipeline attention with loop-carried state."""
+        query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_fori_loop_correctness(self) -> None:
+        """Test fori_loop attention with loop-carried state."""
+        query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        args = (query, key, val)
+        code, result = code_and_output(
+            pallas_attention,
+            args,
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_emit_pipeline_non_divisible(self) -> None:
+        """Test emit_pipeline with seq_kv not divisible by block_k.
+
+        Uses _explicit_indices to pass iteration index into body for
+        proper mask computation on partial tiles.
+        """
+        # seq=384, block_k=256 -> 2 tiles, last is partial (128/256)
+        query = torch.randn(1, 2, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 2, 384, 128, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[2, 128, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("_explicit_indices=True", _code)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_emit_pipeline_loop_order(self) -> None:
+        """Test emit_pipeline with loop_order reordering.
+
+        Without the fix, program_id mapping uses logical grid_block_ids
+        order instead of pid_info order (which reflects loop_order),
+        producing wrong results.
+        """
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(1, 256, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_matmul_broadcast_bias,
+            (x, y, bias),
+            block_sizes=[16, 128, 64],
+            loop_orders=[[1, 0]],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = (x.float() @ y.float() + bias.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    @xfailIfPallas("RDIM_SIZE rounded to next power of 2 causes shape mismatch")
+    def test_reduce_non_pow2(self) -> None:
+        """Reduction over non-power-of-2 dim should use exact size, not rounded."""
+        x = torch.randn(128, 1000, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(pallas_reduce_non_pow2, (x,), block_size=128)
+        expected = torch.nn.functional.softmax(x, dim=-1)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":

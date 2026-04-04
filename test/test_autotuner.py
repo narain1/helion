@@ -143,6 +143,23 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         assert "HELION_AUTOTUNE_IGNORE_ERRORS" in str(err.value)
 
+    def test_llvm_translation_failure_skips_config(self):
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("failed to translate module to LLVM IR")
+
+        with patch("torch.accelerator.synchronize", autospec=True) as sync:
+            sync.return_value = None
+            result = search.benchmark_function("cfg", bad_fn)
+
+        self.assertEqual(result, float("inf"))
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
     def test_ignore_errors_skips_logging_and_raise(self):
         settings = Settings(
             autotune_ignore_errors=True,
@@ -356,7 +373,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         with (
             patch(
-                "helion.autotuner.base_search.make_precompiler",
+                "helion.autotuner.precompile_future.make_precompiler",
                 side_effect=fake_make_precompiler,
             ),
             patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
@@ -451,7 +468,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
-    @skipIfRocm("failure on rocm")
+    @skipIfRocm("config space differs on ROCm")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -470,7 +487,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
-    @skipIfRocm("should skip on rocm")
+    @skipIfRocm("config space differs on ROCm")
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -490,7 +507,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
-    @skipIfRocm("should skip on rocm")
+    @skipIfRocm("config space differs on ROCm")
     def test_config_warp_specialize_unroll(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -583,6 +600,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(add(*args), sum(args))
 
+    def test_finite_search_all_configs_fail_raises(self):
+        """Test that when all configs fail, the error is re-raised.
+
+        Without this, compile failures would be silently swallowed and the
+        autotuner would return no results. We must surface the error so
+        users know their configs are incompatible with the input shape.
+        """
+
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[64]),
+                helion.Config(block_sizes=[128]),
+            ],
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        with self.assertRaises(exc.InvalidConfig):
+            add(*args)
+
     def test_run_finite_search(self):
         @helion.kernel(
             configs=[
@@ -611,6 +656,40 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([8, 512, 512], device=DEVICE),
         )
         torch.testing.assert_close(add(*args), sum(args))
+        torch.testing.assert_close(add(*args), sum(args))
+
+    def test_finite_search_skips_bad_configs(self):
+        """Test that configs that fail to compile are skipped.
+
+        Uses a config with wrong number of block_sizes (1 instead of 3)
+        placed between two good configs, to verify the skip logic doesn't
+        disrupt processing of subsequent valid configs.
+        """
+
+        @helion.kernel(
+            configs=[
+                # Good config
+                helion.Config(block_sizes=[1, 64, 64], num_warps=8),
+                # Bad config: insufficient block_sizes for a 3D kernel
+                helion.Config(block_sizes=[64]),
+                # Good config after bad one — must still work
+                helion.Config(block_sizes=[1, 1, 512], num_warps=8),
+            ],
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        # Bad config (block_sizes=[64]) has wrong number of block_sizes for
+        # 3D input and should fail to compile. The surrounding good configs
+        # should allow autotuning to succeed.
         torch.testing.assert_close(add(*args), sum(args))
 
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
@@ -790,7 +869,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 EnumFragment(("a", "b")),
             ],
             block_size_indices=[0, 1],
+            overridden_flat_indices=set(),
         )
+        search.num_neighbors_cap = -1
 
         base = [32, 64, "a"]
         neighbors = search._generate_neighbors(base)
@@ -813,6 +894,99 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
+    def test_pattern_search_skips_overridden_indices(self):
+        """Neighbors are not generated along overridden (frozen) indices."""
+        search = PatternSearch.__new__(PatternSearch)
+        search._visited = set()
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),  # block_size[0] — index 0
+                PowerOfTwoFragment(16, 128, 64),  # block_size[1] — index 1
+                EnumFragment(("a", "b")),  # some enum — index 2
+            ],
+            block_size_indices=[0, 1],
+            overridden_flat_indices={1},  # freeze block_size[1]
+        )
+        search.num_neighbors_cap = -1
+
+        base = [32, 64, "a"]
+        neighbors = search._generate_neighbors(base)
+
+        # No neighbor should change index 1 (frozen)
+        for flat in neighbors:
+            self.assertEqual(flat[1], 64)
+
+        # Neighbors should still vary indices 0 and 2
+        changed_indices = set()
+        for flat in neighbors:
+            for i, (v, b) in enumerate(zip(flat, base, strict=False)):
+                if v != b:
+                    changed_indices.add(i)
+        self.assertIn(0, changed_indices)
+        self.assertIn(2, changed_indices)
+        self.assertNotIn(1, changed_indices)
+
+        # No block-size pair neighbors should be generated (only 1 non-frozen block index)
+        pair_neighbors = [
+            flat
+            for flat in neighbors
+            if sum(1 for v, b in zip(flat, base, strict=False) if v != b) == 2
+        ]
+        self.assertEqual(pair_neighbors, [])
+
+    def test_differential_mutation_skips_overridden_indices(self):
+        """Differential mutation does not mutate overridden indices."""
+        random.seed(42)
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        overrides = {"num_warps": 8}
+        gen = ConfigGeneration(spec, overrides=overrides)
+
+        # Find the num_warps flat index
+        warp_idx = gen.num_warps_index
+        self.assertIn(warp_idx, gen.overridden_flat_indices)
+
+        base = gen.default_flat()
+        a = gen.random_flat()
+        b = gen.random_flat()
+        c = gen.random_flat()
+
+        # Run many mutations — overridden index should never change
+        for _ in range(50):
+            result = gen.differential_mutation(base, a, b, c, crossover_rate=0.9)
+            self.assertEqual(result[warp_idx], base[warp_idx])
+
+    def test_lfbo_pattern_search_skips_overridden_indices(self):
+        """LFBOPatternSearch._generate_neighbors skips overridden indices."""
+        random.seed(123)
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.num_neighbors = 50
+        search.radius = 2
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),  # block_size[0]
+                PowerOfTwoFragment(16, 128, 64),  # block_size[1]
+                PowerOfTwoFragment(2, 16, 4),  # num_warps
+                EnumFragment(("a", "b", "c")),  # some enum
+                BooleanFragment(),  # some boolean
+            ],
+            block_size_indices=[0, 1],
+            num_warps_index=2,
+            overridden_flat_indices={1, 2},  # freeze block_size[1] and num_warps
+        )
+        search.num_neighbors_cap = -1
+
+        base = [32, 64, 4, "b", True]
+        neighbors = search._generate_neighbors(base)
+
+        # No neighbor should change indices 1 or 2
+        for flat in neighbors:
+            self.assertEqual(flat[1], 64)
+            self.assertEqual(flat[2], 4)
+
     def test_lfbo_pattern_search_generate_neighbors(self):
         """Test LFBOPatternSearch._generate_neighbors method."""
         random.seed(123)
@@ -829,7 +1003,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
             block_size_indices=[0, 1],
             num_warps_index=2,
+            overridden_flat_indices=set(),
         )
+        search.num_neighbors_cap = -1
 
         base = [32, 64, 4, "b", True]
         neighbors = search._generate_neighbors(base)
@@ -931,12 +1107,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                             search.autotune()
                         return
 
-                    _, bad_time = search.benchmark(bad_config)
+                    bad_time = search.benchmark(bad_config).perf
                     assert math.isinf(bad_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
                     search._autotune_metrics.num_accuracy_failures = 0
 
-                    _, good_time = search.benchmark(good_config)
+                    good_time = search.benchmark(good_config).perf
                     assert not math.isinf(good_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
                     search._autotune_metrics.num_accuracy_failures = 0
@@ -1013,12 +1189,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                             search.autotune()
                         return
 
-                    _, bad_time = search.benchmark(bad_config)
+                    bad_time = search.benchmark(bad_config).perf
                     assert math.isinf(bad_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
                     search._autotune_metrics.num_accuracy_failures = 0
 
-                    _, good_time = search.benchmark(good_config)
+                    good_time = search.benchmark(good_config).perf
                     assert not math.isinf(good_time)
                     self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
                     search._autotune_metrics.num_accuracy_failures = 0
@@ -1126,13 +1302,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 ),
             ):
                 # Bad config should be filtered out by accuracy check
-                _, bad_time = search.benchmark(bad_config)
+                bad_time = search.benchmark(bad_config).perf
                 self.assertTrue(math.isinf(bad_time))
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
 
                 # Good config should pass accuracy check
                 search._autotune_metrics.num_accuracy_failures = 0
-                _, good_time = search.benchmark(good_config)
+                good_time = search.benchmark(good_config).perf
                 self.assertFalse(math.isinf(good_time))
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
@@ -1418,6 +1594,95 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(lfbo_tree.copies, explicit_copies)
         self.assertEqual(lfbo_tree.max_generations, explicit_max_gen)
 
+    def test_finishing_rounds(self):
+        """finishing_rounds comes from profile, env var overrides, explicit ctor arg wins."""
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+
+        @helion.kernel(autotune_effort="quick")
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        bound = add.bind(args)
+        quick_profile = get_effort_profile("quick")
+
+        # Default: comes from effort profile
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(
+                autotuner.autotuner.finishing_rounds, quick_profile.finishing_rounds
+            )
+
+        # Env var overrides effort profile
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNE_FINISHING_ROUNDS": "7",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.finishing_rounds, 7)
+
+        # Explicit constructor arg wins over env var
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNE_FINISHING_ROUNDS": "7",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, finishing_rounds=3)
+            self.assertEqual(autotuner.autotuner.finishing_rounds, 3)
+
+    def test_num_neighbors_cap(self):
+        """num_neighbors_cap defaults to -1, env var overrides, explicit ctor arg wins."""
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+
+        @helion.kernel()
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        bound = add.bind(args)
+
+        # Default: -1 (no cap)
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, -1)
+
+        # Env var overrides default
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
+
+        # Explicit constructor arg wins over env var
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, num_neighbors_cap=10)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 10)
+
     def test_autotuner_disabled(self):
         @helion.kernel()
         def add(a, b):
@@ -1468,7 +1733,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         perm_frag = PermutationFragment(length=3)
         self.assertEqual(perm_frag.dim(), 3)
         encoded = perm_frag.encode([0, 1, 2])
-        self.assertEqual(encoded, [0, 1, 2])
+        self.assertEqual(encoded, [0.0, 1.0, 2.0])
 
         # Test ListOf with BooleanFragment
         list_frag = ListOf(inner=BooleanFragment(), length=3)
@@ -1765,14 +2030,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 ),
             ):
                 # bad_config has a few large diffs — custom check should accept it
-                _, bad_time = search.benchmark(bad_config)
+                bad_time = search.benchmark(bad_config).perf
                 assert not math.isinf(bad_time), (
                     "custom check should allow config with 1/N large diffs"
                 )
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 
                 # good_config produces exact match — should also pass
-                _, good_time = search.benchmark(good_config)
+                good_time = search.benchmark(good_config).perf
                 assert not math.isinf(good_time)
                 self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
 

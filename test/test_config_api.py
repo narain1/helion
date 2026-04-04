@@ -266,6 +266,29 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
+    def test_distributed_limits_pid_types_to_persistent(self) -> None:
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(
+            env.config_spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved"),
+        )
+
+    def test_persistent_block_limit_caps_num_sm_multiplier(self) -> None:
+        # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
+
     def test_backend_env_var_accepts_cute(self) -> None:
         with patch.dict(
             os.environ,
@@ -321,6 +344,23 @@ class TestSettingsEnv(TestCase):
             rf"Unsupported config keys for backend '{env.backend_name}'",
         ):
             env.config_spec.normalize({"num_threads": [2]})
+
+    def test_block_size_spec_max_size_bounded_by_world_size(self) -> None:
+        """Regression test: BlockSizeSpec.max_size must be bounded by size_hint//world_size
+        in a distributed setting, not the raw size_hint."""
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        size_hint = 1024
+        world_size = 4
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+        ):
+            spec = BlockSizeSpec(block_id=0, size_hint=size_hint)
+
+        # max_size should be bounded by size_hint // world_size = 256, not 1024
+        self.assertLessEqual(spec.max_size, size_hint // world_size)
 
     def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
         with patch.dict(
@@ -460,6 +500,28 @@ class TestHardwareConfigSpecRanges(TestCase):
         # TileIR uses fixed num_warps of 4
         self.assertEqual(num_warps.low, 4)
         self.assertEqual(num_warps.high, 4)
+
+    def test_eviction_policy_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_eviction_policies.inner.choices, ("",))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(
+            nvidia_spec.load_eviction_policies.inner.choices,
+            ("", "first", "last"),
+        )
 
 
 if __name__ == "__main__":

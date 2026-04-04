@@ -98,10 +98,10 @@ class TileStrategyDispatch:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
         state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)
+        state.codegen.set_active_loops(grid_state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
                 other_strategy.codegen_preamble(state)
-        state.codegen.set_active_loops(grid_state)
 
     def codegen_device_loop(
         self, state: CodegenState, block_ids: list[int]
@@ -112,7 +112,7 @@ class TileStrategyDispatch:
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
         compacted_shapes = []
         for idx, shape in enumerate(shapes):
-            block_idx = CompileEnvironment.current().get_block_id(shape)
+            block_idx = CompileEnvironment.current().resolve_block_id(shape)
             if block_idx is None:
                 # Check if this is a symbolic expression with block sizes
                 shape_str = self._get_shape_string(shape)
@@ -224,6 +224,89 @@ class TileStrategyDispatch:
                 axis += strategy.thread_axes_used()
         return None
 
+    def thread_axis_for_block_id(self, target_block_id: int) -> int | None:
+        """Return the launch thread axis assigned to a specific logical block id."""
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids:
+                continue
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                return None
+            local_axis_map = getattr(strategy, "_thread_axis_map", None)
+            if callable(local_axis_map):
+                axis_map = local_axis_map()
+                if isinstance(axis_map, dict):
+                    local_axis = axis_map.get(target_block_id)
+                    if local_axis is not None:
+                        return base_axis + local_axis
+            if strategy.thread_axes_used() > 0:
+                return base_axis
+        return None
+
+    def _iter_strategy_thread_axes(
+        self, strategy: TileStrategy
+    ) -> list[tuple[int, int, int | None, str | None]]:
+        ordered_block_ids = getattr(strategy, "loop_order", None)
+        if ordered_block_ids is None:
+            block_id_order = list(strategy.block_ids)
+        else:
+            block_id_order = [strategy.block_ids[i] for i in ordered_block_ids]
+        axis_map_fn = getattr(strategy, "_thread_axis_map", None)
+        axis_map = axis_map_fn() if callable(axis_map_fn) else None
+        total_axes = strategy.thread_axes_used()
+        size_iter = iter(strategy.thread_block_sizes())
+        expr_iter = iter(strategy.thread_block_size_exprs())
+        result: list[tuple[int, int, int | None, str | None]] = []
+        for idx, block_id in enumerate(block_id_order):
+            local_axis = (
+                axis_map.get(block_id, idx) if isinstance(axis_map, dict) else idx
+            )
+            if idx + 1 < len(block_id_order):
+                next_axis = (
+                    axis_map.get(block_id_order[idx + 1], local_axis + 1)
+                    if isinstance(axis_map, dict)
+                    else idx + 1
+                )
+            else:
+                next_axis = total_axes
+            if local_axis >= next_axis:
+                continue
+            size = next(size_iter, None)
+            expr = next(expr_iter, None)
+            result.append((block_id, local_axis, size, expr))
+        return result
+
+    def thread_extent_for_block_id(self, target_block_id: int) -> int | None:
+        """Return the live thread extent for a specific logical block id."""
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids:
+                continue
+            if isinstance(strategy, ReductionStrategy):
+                count = strategy._reduction_thread_count()
+                return count if count > 0 else None
+            for block_id, _local_axis, size, _expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if block_id == target_block_id:
+                    return size
+        return None
+
+    def thread_axis_sizes(self) -> dict[int, int]:
+        dims = self.thread_block_dims()
+        return {axis: size for axis, size in enumerate(dims) if size > 1}
+
+    def _thread_extent_expr_for_block_id(self, target_block_id: int) -> str | None:
+        """Return the launch-time thread extent expression for a specific block id."""
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids:
+                continue
+            for block_id, _local_axis, _size, expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if block_id == target_block_id:
+                    return expr
+        return None
+
     def thread_block_dims(self) -> tuple[int, int, int]:
         """Compute the CUDA thread block dims from all strategies.
 
@@ -234,13 +317,17 @@ class TileStrategyDispatch:
         branches = self._strategy_branches()
         dims = [1, 1, 1]
         for branch in branches:
+            branch_dims = [1, 1, 1]
             ordered = self._ordered_strategies_for_branch(branch)
-            axis = 0
             for strategy in ordered:
-                for size in strategy.thread_block_sizes():
-                    if axis < len(dims):
-                        dims[axis] = max(dims[axis], size)
-                    axis += 1
+                for block_id in strategy.block_ids:
+                    axis = self.thread_axis_for_block_id(block_id)
+                    size = self.thread_extent_for_block_id(block_id)
+                    if axis is None or size is None or size <= 1 or axis >= len(dims):
+                        continue
+                    branch_dims[axis] = max(branch_dims[axis], size)
+            for axis, size in enumerate(branch_dims):
+                dims[axis] = max(dims[axis], size)
         return dims[0], dims[1], dims[2]
 
     def thread_block_dim_exprs(self) -> tuple[str, str, str] | None:
@@ -254,9 +341,12 @@ class TileStrategyDispatch:
         if len(branches) != 1:
             return None
         dims = ["1", "1", "1"]
-        axis = 0
         for strategy in self._ordered_strategies_for_branch(branches[0]):
-            for size_expr in strategy.thread_block_size_exprs():
+            for block_id in strategy.block_ids:
+                axis = self.thread_axis_for_block_id(block_id)
+                size_expr = self._thread_extent_expr_for_block_id(block_id)
+                if axis is None or size_expr is None:
+                    continue
                 if axis >= len(dims):
                     return None
                 current = dims[axis]
@@ -267,7 +357,6 @@ class TileStrategyDispatch:
                         dims[axis] = str(max(int(current), int(size_expr)))
                     else:
                         return None
-                axis += 1
         return dims[0], dims[1], dims[2]
 
     def expand_str(self, shape: ShapeLike, i: int) -> str:
@@ -286,6 +375,54 @@ class TileStrategyDispatch:
         if result == [":"]:
             return ""
         return f"[{', '.join(result)}]"
+
+    def jagged_tile_expand_str(self, src_shape: ShapeLike, dst_shape: ShapeLike) -> str:
+        """Return suffix to transform src to dst using permute + None indexing.
+
+        Examples:
+            (u0, u2) -> (u0, u2, u1) => "[:, :, None]"
+            (u2, u0) -> (u0, u2, u1) => ".permute(1, 0)[:, :, None]"
+        """
+        if not self.supports_index_rank_expansion():
+            return ""
+        if len(src_shape) == 0:
+            return ""
+        assert len(src_shape) <= len(dst_shape), (src_shape, dst_shape)
+
+        env = CompileEnvironment.current()
+
+        # Map each source dim to a unique destination dim with equal symbolic size.
+        src_to_dst: list[int] = []
+        used_dst: set[int] = set()
+        for src_dim in src_shape:
+            match: int | None = None
+            for dst_i, dst_dim in enumerate(dst_shape):
+                if dst_i in used_dst:
+                    continue
+                if env.known_equal(src_dim, dst_dim):
+                    match = dst_i
+                    break
+            assert match is not None, (
+                f"Cannot map src dim {src_dim} into dst shape {dst_shape} "
+                f"from src shape {src_shape}"
+            )
+            src_to_dst.append(match)
+            used_dst.add(match)
+
+        # Reorder source axes so they match destination axis order.
+        perm = sorted(range(len(src_shape)), key=lambda src_i: src_to_dst[src_i])
+
+        parts: list[str] = []
+        if perm != list(range(len(src_shape))):
+            parts.append(f".permute({', '.join(str(i) for i in perm)})")
+
+        # Add singleton dimensions where destination has extra axes.
+        keep = set(src_to_dst)
+        index_parts = [":" if i in keep else "None" for i in range(len(dst_shape))]
+        if not all(x == ":" for x in index_parts):
+            parts.append(f"[{', '.join(index_parts)}]")
+
+        return "".join(parts)
 
     def expand_dims_str(self, shape: ShapeLike, start_idx: int, num_dims: int) -> str:
         """Generate expansion string for multi-dimensional tensor indexers.

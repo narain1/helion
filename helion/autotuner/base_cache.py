@@ -17,16 +17,25 @@ from torch._inductor.codecache import torch_key
 
 from .. import exc
 from .._utils import counters
-from ..runtime.kernel import BoundKernel
 from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def should_skip_cache() -> bool:
+    """Return True when the user has requested that cache reads be skipped."""
+    return os.environ.get("HELION_SKIP_CACHE", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+    }
 
 
 class AutotuneCacheMeta(abc.ABCMeta):
@@ -45,9 +54,11 @@ class AutotuneCacheMeta(abc.ABCMeta):
         """
 
         def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
-            if not isinstance(kernel, BoundKernel):
+            if not kernel.is_cacheable():
                 raise TypeError(
-                    "Autotune caches require a BoundKernel; external kernels are not cacheable"
+                    f"Autotune caches require a cacheable kernel "
+                    f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                    f"External kernels are not cacheable."
                 )
             return cls(search_cls(kernel, args))  # type: ignore[misc]
 
@@ -112,6 +123,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     kernel_source_hash: Hash of source code of input Helion kernel
     hardware: Hardware of the input device
     runtime_name: Version of the cuda/rocm arch
+    backend: Kernel backend (e.g. triton, pallas)
+    config_spec_hash: Hash of the config spec (available knobs and their ranges)
+    extra_cache_key: Optional extra cache key from the kernel (e.g. fusion context hash)
     """
 
     kernel_source_hash: str
@@ -119,6 +133,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     runtime_name: str
     backend: str
     config_spec_hash: str = ""
+    extra_cache_key: str = ""
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
@@ -151,13 +166,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
     def __init__(self, autotuner: BaseSearch) -> None:
         self.autotuner = autotuner
-        if not isinstance(self.autotuner.kernel, BoundKernel):
+        kernel = self.autotuner.kernel
+        if not kernel.is_cacheable():
             raise TypeError(
-                f"Autotune caches require a BoundKernel; got"
-                f" {type(self.autotuner.kernel).__name__}."
-                " External kernels are not cacheable."
+                f"Autotune caches require a cacheable kernel "
+                f"(e.g. BoundKernel); got {type(kernel).__name__}. "
+                f"External kernels are not cacheable."
             )
-        self.kernel: BoundKernel = self.autotuner.kernel
+        self.kernel: BoundKernel = kernel  # type: ignore[assignment]
         self.args = self.autotuner.args
 
     @abc.abstractmethod
@@ -183,31 +199,32 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         raise NotImplementedError
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
-        if skip_cache or os.environ.get("HELION_SKIP_CACHE", "") not in {
-            "",
-            "0",
-            "false",
-            "False",
-        }:
-            return self.autotuner.autotune()
+        """Run autotuning, consulting and updating the on-disk cache.
 
-        if (config := self.get()) is not None:
-            counters["autotune"]["cache_hit"] += 1
-            log.debug("cache hit: %s", str(config))
-            kernel_decorator = self.kernel.format_kernel_decorator(
-                config, self.autotuner.settings
-            )
-            print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
-            cache_info = self._get_cache_info_message()
-            self.autotuner.log(
-                f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
-            )
-            return config
+        ``skip_cache`` (set by HELION_FORCE_AUTOTUNE) skips reading but
+        still writes back.  HELION_SKIP_CACHE skips both reading and writing.
+        """
+        skip_cache_env = should_skip_cache()
+        skip_read = skip_cache or skip_cache_env
+
+        if not skip_read:
+            if (config := self.get()) is not None:
+                counters["autotune"]["cache_hit"] += 1
+                log.debug("cache hit: %s", str(config))
+                kernel_decorator = self.kernel.format_kernel_decorator(
+                    config, self.autotuner.settings
+                )
+                print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
+                cache_info = self._get_cache_info_message()
+                self.autotuner.log(
+                    f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+                )
+                return config
 
         counters["autotune"]["cache_miss"] += 1
         log.debug("cache miss")
 
-        if os.environ.get("HELION_ASSERT_CACHE_HIT") == "1":
+        if not skip_read and os.environ.get("HELION_ASSERT_CACHE_HIT") == "1":
             current_key = self._get_cache_key()
             print("\n" + "=" * 80, file=sys.stderr)
             print("HELION_ASSERT_CACHE_HIT: Cache miss detected!", file=sys.stderr)
@@ -248,8 +265,9 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         config = self.autotuner.autotune()
 
-        self.put(config)
-        counters["autotune"]["cache_put"] += 1
-        log.debug("cache put: %s", str(config))
+        if not skip_cache_env:
+            self.put(config)
+            counters["autotune"]["cache_put"] += 1
+            log.debug("cache put: %s", str(config))
 
         return config

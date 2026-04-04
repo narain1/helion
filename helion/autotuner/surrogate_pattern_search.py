@@ -6,17 +6,22 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
+from .base_search import check_population_consistency
 from .base_search import performance
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
 
+    from ..autotuner.effort_profile import AutotuneEffortProfile
     from ..runtime.config import Config
+    from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .config_generation import FlatConfig
 
@@ -91,8 +96,9 @@ class LFBOPatternSearch(PatternSearch):
             already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
-            FROM_DEFAULT starts from only the default configuration.
-            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var ("from_random" or "from_default").
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
     """
 
     def __init__(
@@ -111,6 +117,9 @@ class LFBOPatternSearch(PatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
+        num_neighbors_cap: int = -1,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -128,6 +137,9 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
+            num_neighbors_cap=num_neighbors_cap,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )
@@ -144,6 +156,26 @@ class LFBOPatternSearch(PatternSearch):
         self.train_x = []
         self.train_y = []
         self.quantile = quantile
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        from ..runtime.settings import _get_initial_population_strategy
+
+        assert profile.lfbo_pattern_search is not None
+        strategy = _get_initial_population_strategy(
+            profile.lfbo_pattern_search.initial_population_strategy,
+            settings.autotune_initial_population_strategy,
+        )
+        return {
+            "initial_population": profile.lfbo_pattern_search.initial_population,
+            "copies": profile.lfbo_pattern_search.copies,
+            "max_generations": profile.lfbo_pattern_search.max_generations,
+            "initial_population_strategy": strategy,
+            "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
+            **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
+        }
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -267,7 +299,8 @@ class LFBOPatternSearch(PatternSearch):
         surrogate: RandomForestClassifier | None = self.surrogate
         if surrogate is None:
             # If surrogate is None, scores are random
-            scores = [random.random() for _ in range(n_samples)]
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
+                scores = [random.random() for _ in range(n_samples)]
         else:
             proba = np.asarray(surrogate.predict_proba(candidate_X))[:, 1]
 
@@ -348,6 +381,9 @@ class LFBOPatternSearch(PatternSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
+        check_population_consistency(
+            self.population, process_group_name=self.kernel.env.process_group_name
+        )
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -369,8 +405,10 @@ class LFBOPatternSearch(PatternSearch):
         self._fit_surrogate()
 
         search_copies = [
-            self._pruned_pattern_search_from(m, visited) for m in starting_points
+            self._pruned_pattern_search_from(idx, m, visited)
+            for idx, m in enumerate(starting_points)
         ]
+
         for generation in range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
@@ -385,6 +423,9 @@ class LFBOPatternSearch(PatternSearch):
                     for member in added:
                         new_population[id(member)] = member
             if num_active == 0:
+                self.log(
+                    f"Autotuning stop at generation {generation} because of no active search path"
+                )
                 break
 
             # Log generation header before compiling/benchmarking
@@ -407,13 +448,16 @@ class LFBOPatternSearch(PatternSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Update training data
-            for member in self.population:
-                self.train_x.append(self.config_gen.encode_config(member.flat_values))
-                self.train_y.append(member.perf)
-
-            # Fit model
-            self._fit_surrogate()
+            # no need to retrain the model for the last generation
+            if generation != self.max_generations:
+                # Update training data with newly benchmarked members only
+                for member in unbenchmarked:
+                    self.train_x.append(
+                        self.config_gen.encode_config(member.flat_values)
+                    )
+                    self.train_y.append(member.perf)
+                # Fit model
+                self._fit_surrogate()
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
@@ -437,13 +481,19 @@ class LFBOPatternSearch(PatternSearch):
         neighbors: list[FlatConfig] = []
 
         # Generate num_neighbors random neighbors
+        overridden = self.config_gen.overridden_flat_indices
+        eligible_block = [
+            i for i in self.config_gen.block_size_indices if i not in overridden
+        ]
+        warp_idx = self.config_gen.num_warps_index
+        tune_warps = warp_idx >= 0 and warp_idx not in overridden
         for _ in range(self.num_neighbors):
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
             # 1. Sample a block size index and change it
-            if self.config_gen.block_size_indices:
-                block_idx = random.choice(self.config_gen.block_size_indices)
+            if eligible_block:
+                block_idx = random.choice(eligible_block)
                 modified_indices.add(block_idx)
 
                 block_spec = self.config_gen.flat_spec[block_idx]
@@ -454,8 +504,7 @@ class LFBOPatternSearch(PatternSearch):
                     new_flat[block_idx] = random.choice(block_neighbors)
 
             # 2. Sample the num_warps index and change it
-            if self.config_gen.num_warps_index >= 0:
-                warp_idx = self.config_gen.num_warps_index
+            if tune_warps:
                 modified_indices.add(warp_idx)
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
@@ -471,7 +520,7 @@ class LFBOPatternSearch(PatternSearch):
             # Collect available pattern neighbors for remaining indices
             remaining_pattern_neighbors = []
             for index, spec in enumerate(self.config_gen.flat_spec):
-                if index not in modified_indices:
+                if index not in modified_indices and index not in overridden:
                     pattern_neighbors = spec.pattern_neighbors(base[index])
                     if pattern_neighbors:
                         remaining_pattern_neighbors.append((index, pattern_neighbors))
@@ -492,10 +541,11 @@ class LFBOPatternSearch(PatternSearch):
             if new_flat != base:
                 neighbors.append(new_flat)
 
-        return neighbors
+        return self.shrink_neighbors(neighbors)
 
     def _pruned_pattern_search_from(
         self,
+        copy_idx: int,
         current: PopulationMember,
         visited: set[Config],
     ) -> Iterator[list[PopulationMember]]:
@@ -518,7 +568,8 @@ class LFBOPatternSearch(PatternSearch):
         patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            all_neighbors = self._generate_neighbors(current.flat_values)
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
+                all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member.config not in visited:
@@ -530,6 +581,7 @@ class LFBOPatternSearch(PatternSearch):
             candidates = self._surrogate_select(candidates, n_sorted)
 
             if len(candidates) <= 1:
+                self.log(f"Copy {copy_idx} finish because of no candidates")
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
             best = min(candidates, key=performance)
@@ -537,6 +589,7 @@ class LFBOPatternSearch(PatternSearch):
                 if patience > 0:
                     patience -= 1
                 else:
+                    self.log(f"Copy {copy_idx} finish because of no improvement")
                     return
             current = best
 
@@ -613,9 +666,9 @@ class LFBOTreeSearch(LFBOPatternSearch):
             already selected in the batch. Default: 1.0.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates initial_population random configs.
-            FROM_DEFAULT starts from only the default configuration.
-            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var
-            ("from_random" or "from_default").
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
+            Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
     """
 
     def __init__(
@@ -634,6 +687,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
         patience: int = 1,
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -651,6 +706,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
             patience=patience,
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )
@@ -704,6 +761,12 @@ class LFBOTreeSearch(LFBOPatternSearch):
         n_trees = len(surrogate.estimators_)
         base_list = list(base)
         base_encoded = np.array(config_gen.encode_config(base), dtype=np.float64)
+        overridden = config_gen.overridden_flat_indices
+        eligible_block = [
+            i for i in config_gen.block_size_indices if i not in overridden
+        ]
+        warp_idx = config_gen.num_warps_index
+        tune_warps = warp_idx >= 0 and warp_idx not in overridden
 
         all_results: list[FlatConfig] = []
 
@@ -718,7 +781,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             path_node_indices = decision_path.indices.tolist()  # type: ignore[union-attr]
 
             # 3. Extract flat_spec indices (deduplicated, order-preserving)
-            seen: set[int] = set()
+            seen: set[int] = set(overridden)
             path_flat_indices: list[int] = []
             for node_id in path_node_indices:
                 feat = tree.feature[node_id]  # pyrefly: ignore [missing-attribute]
@@ -729,17 +792,14 @@ class LFBOTreeSearch(LFBOPatternSearch):
                         path_flat_indices.append(flat_idx)
 
             # 4. Augment with block_size and num_warps indices
-            if config_gen.block_size_indices:
-                bs_idx = random.choice(config_gen.block_size_indices)
+            if eligible_block:
+                bs_idx = random.choice(eligible_block)
                 if bs_idx not in seen:
                     seen.add(bs_idx)
                     path_flat_indices.append(bs_idx)
-            if (
-                config_gen.num_warps_index >= 0
-                and config_gen.num_warps_index not in seen
-            ):
-                seen.add(config_gen.num_warps_index)
-                path_flat_indices.append(config_gen.num_warps_index)
+            if tune_warps and warp_idx not in seen:
+                seen.add(warp_idx)
+                path_flat_indices.append(warp_idx)
 
             # 5. Greedy traversal with incremental encoding
             current_flat: FlatConfig = list(base)
