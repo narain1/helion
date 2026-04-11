@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -115,7 +116,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
+            self.kernel.kernel._base_specialization_key(self.args),
         )
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
@@ -137,6 +138,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = str(torch.version.cuda)
             elif torch.version.hip is not None:
                 runtime_name = torch.version.hip
+        elif dev.type == "mps":
+            # Include OS version as Metal runtime is part of OS
+            runtime_name = platform.mac_ver()[0] or "mps"
         elif dev.type == "tpu":
             hardware = "tpu"
             try:
@@ -144,6 +148,15 @@ class LocalAutotuneCache(AutotuneCacheBase):
 
                 runtime_name = getattr(torch_tpu, "__version__", "unknown")
             except ImportError:
+                runtime_name = "unknown"
+        elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
+            hardware = "pallas_interpret"
+            runtime_name = "interpret"
+        elif dev.type == "mtia":
+            hardware = hardware or "mtia"
+            try:
+                runtime_name = str(torch.mtia.get_device_properties(dev))
+            except Exception:
                 runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
@@ -156,6 +169,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             runtime_name=runtime_name,
             backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
+            extra_cache_key=self.kernel.extra_cache_key(),
         )
 
     def _get_local_cache_path(self) -> Path:
@@ -207,7 +221,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
 
     def _get_cache_info_message(self) -> str:
         cache_dir = self._get_local_cache_path().parent
-        return f"Cache directory: {cache_dir}. To run autotuning again, delete the cache directory or set HELION_SKIP_CACHE=1."
+        return f"Cache directory: {cache_dir}. To re-tune and update the cache, set HELION_FORCE_AUTOTUNE=1."
 
     def _get_cache_key(self) -> LooseAutotuneCacheKey:
         return self.key

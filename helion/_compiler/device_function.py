@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+import contextlib
 import dataclasses
 import itertools
 import math
@@ -280,6 +281,14 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        # Arg names referenced only by fusion placeholder strings
+        # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
+        # DCE would incorrectly strip them without this exemption.
+        self.placeholder_args: set[str] = set()
+        # Sourceless prologue params (e.g. ones_like) that are fully inlined
+        # by the prologue hook.  These should be DCE'd away and also removed
+        # from the host function signature (populated by _codegen_prologue_fusion).
+        self.sourceless_prologue_params: set[str] = set()
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
@@ -301,10 +310,23 @@ class DeviceFunction:
         self.device_store_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
+        self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
         # Pallas: id(fake_tensor) → {dim: block_id}, recorded during codegen
         self.pallas_tensor_dim_block_ids: dict[int, dict[int, int]] = {}
+        # Pallas: set of id(fake_tensor) for tensors accessed in pipeline body
+        self.pallas_pipeline_tensor_ids: set[int] = set()
+        # TODO(dunfanlu): consider duplicating and aliasing arguments if a tensor needs to be accessed via both VMEM and SMEM?
+        # Pallas: set of id(fake_tensor) for tensors requiring scalar accessing (SMEM)
+        self.pallas_smem_tensor_ids: set[int] = set()
+
+    def allocate_store_index(self) -> int:
+        """Bump store counters and return the indexing strategy slot."""
+        self.device_store_index += 1
+        idx = self.device_memory_op_index
+        self.device_memory_op_index += 1
+        return idx
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
@@ -339,21 +361,13 @@ class DeviceFunction:
         """Check if this kernel uses any RNG operations."""
         return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
 
-    def allocate_rng_seed(self) -> int:
-        """Allocate a new RNG seed index and ensure buffer argument exists.
-
-        Returns:
-            The seed index for this RNG operation.
-        """
-        seed_index = self.rng_seed_count
-        self.rng_seed_count += 1
-
-        # Ensure seed buffer parameter name exists
+    def reserve_rng_seed(self, seed_index: int) -> None:
+        """Ensure the RNG seed buffer is available up to a specific index."""
+        assert seed_index >= 0
+        self.rng_seed_count = max(self.rng_seed_count, seed_index + 1)
         if self.rng_seed_buffer_param_name is None:
             # pyrefly: ignore [bad-assignment]
             self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
-
-        return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
         key = (block_id,)
@@ -425,7 +439,9 @@ class DeviceFunction:
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        with contextlib.suppress(Exception):
+            expr = env.shape_env.simplify(expr)
+        expr = env.specialize_expr(expr)
         if not expr.free_symbols:
             return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
@@ -449,6 +465,7 @@ class DeviceFunction:
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
+        env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
             assert origin.fake_value is not None
@@ -458,11 +475,13 @@ class DeviceFunction:
             )
             return arg.name
         if isinstance(origin.origin, BlockSizeOrigin):
-            result = self.block_size_var(origin.origin.block_id)
+            result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None
             return result
         if isinstance(origin.origin, GridOrigin):
-            return self.codegen.offset_var(origin.origin.block_id)
+            return self.codegen.offset_var(
+                env.resolve_codegen_block_id(origin.origin.block_id, self.codegen)
+            )
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
@@ -685,6 +704,11 @@ class DeviceFunction:
         ]
 
         args = [arg.arg_def_node() for arg in param_args]
+        # Ordering invariant: [param_args, extra_params, rng_seed, scratch_args].
+        # codegen_function_call must match this order — it builds positional args
+        # from param_args, extends with extra_params, then build_launcher_args
+        # appends rng_seed_buffer.
+        args.extend(create_arg(name) for name in self.codegen._extra_params)
         if self.has_rng_ops():
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
@@ -756,6 +780,9 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        # Extra params are positional and must come before any keyword args that
+        # build_launcher_args appends (e.g. num_warps=, num_stages=).
+        args.extend(self.codegen._extra_params)
         call_args = backend.build_launcher_args(
             args,
             tensor_host_args=tensor_host_args,
@@ -784,12 +811,15 @@ class DeviceFunction:
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
 
-        # drop any unused args
+        # Drop unused args, but keep placeholder_args (fusion-injected tensor
+        # pointers referenced only by placeholder strings, not the AST body).
+        # sourceless_prologue_params are intentionally NOT exempted — they are
+        # fully inlined by the prologue hook and should be removed by DCE.
         args_to_remove = {
             arg.name
             for arg in self.arguments
             # pyrefly: ignore [unbound-name]
-            if arg.name not in rw.reads
+            if arg.name not in rw.reads and arg.name not in self.placeholder_args
         }
         if args_to_remove:
             self.arguments = [
@@ -825,7 +855,7 @@ class DeviceFunction:
         for var_name, expr in self.deferred_rdim_defs:
             expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
+                f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
@@ -845,6 +875,13 @@ class DeviceFunction:
         name = self.new_var(name_hint)
         self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
+
+    def scratch_read_slice(self, name: str) -> str | None:
+        """Return the index expression for reading logical data from a padded scratch.
+
+        Returns None if no padding was applied.
+        """
+        return None
 
     def register_dma_semaphore(self, name_hint: str = "sem") -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
@@ -944,3 +981,16 @@ class HelionCutePrinter(HelionTritonPrinter):
 
 def cute_texpr(expr: sympy.Expr) -> str:
     return HelionCutePrinter().doprint(expr)
+
+
+class HelionPallasPrinter(HelionTritonPrinter):
+    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # pyrefly: ignore [missing-attribute]
+        return f"({self._print(lhs)} // {self._print(rhs)})"
+
+
+def pallas_texpr(expr: sympy.Expr) -> str:
+    return HelionPallasPrinter().doprint(expr)

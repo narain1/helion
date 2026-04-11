@@ -12,6 +12,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -53,6 +54,33 @@ def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor) -> torch.Ten
     return x
 
 
+@helion.kernel(static_shapes=True)
+def split_k_atomic_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Split-K matmul with atomic_add into a non-zero output."""
+    m, k = x.size()
+    k2, n = y.size()
+    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for inner_k in hl.tile(tile_k.begin, tile_k.end):
+            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        hl.atomic_add(out, [tile_m, tile_n], acc.to(x.dtype))
+    return out
+
+
+@helion.kernel()
+def atomic_add_f32_into_bf16_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Test atomic_add where value dtype (float32) differs from output (bfloat16)."""
+    m, n = x.size()
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc = acc + x[tile_m, tile_n].to(torch.float32)
+        acc = acc + y[tile_m, tile_n].to(torch.float32)
+        hl.atomic_add(out, [tile_m, tile_n], acc)
+    return out
+
+
 @helion.kernel()
 def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where the index is a symbolic int"""
@@ -60,6 +88,14 @@ def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         hl.atomic_add(y, [tile.begin], 1)
     return y
+
+
+@helion.kernel()
+def atomic_add_tile_begin_reduce_other_axis(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros([x.size(0)], device=x.device, dtype=x.dtype)
+    for tile_m, tile_n in hl.tile([x.size(0), x.size(1)]):
+        hl.atomic_add(out, [tile_m.begin], x[tile_m, tile_n])
+    return out
 
 
 @helion.kernel()
@@ -118,6 +154,15 @@ def atomic_max_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel()
+def atomic_max_return_kernel(
+    x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        out[i] = hl.atomic_max(x, [i], y[i])
+    return out
+
+
+@helion.kernel()
 def atomic_min_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for i in hl.tile(x.size(0)):
         hl.atomic_min(x, [i], y[i])
@@ -133,7 +178,7 @@ def atomic_cas_kernel(
     return x
 
 
-@onlyBackends(["triton", "pallas"])
+@onlyBackends(["triton", "cute", "pallas"])
 class TestAtomicOperations(RefEagerTestBase, TestCase):
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
@@ -151,6 +196,22 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_add", code)
 
+    @xfailIfPallas("view-backed atomic_add targets are not supported on Pallas")
+    def test_basic_atomic_add_strided_target(self):
+        x_base = torch.zeros(16, device=DEVICE)
+        x = x_base[::2]
+        y = torch.ones(8, device=DEVICE)
+
+        code, result = code_and_output(
+            atomic_add_kernel,
+            (x, y),
+            block_sizes=[32],
+        )
+
+        expected = torch.ones(8, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfCute("cute: hl.arange atomic scatter requires an active non-reduction axis")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
@@ -212,6 +273,43 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
         expected = torch.ones(3, 4, device=DEVICE)
         torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["pallas"])
+    def test_atomic_add_f32_into_bf16(self):
+        """atomic_add of a float32 value into a bfloat16 output tensor."""
+        x = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.ones(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        args = (x, y)
+
+        code, result = code_and_output(
+            atomic_add_f32_into_bf16_kernel,
+            args,
+            block_sizes=[64, 128],
+        )
+
+        expected = (x.float() + y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["pallas"])
+    def test_split_k_atomic_add_vmem_preload(self):
+        """Split-K matmul where output is initialised to ones (not zeros)."""
+        m, k, n = 128, 1024, 128
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        args = (x, y)
+
+        code, result = code_and_output(
+            split_k_atomic_add_kernel,
+            args,
+            block_sizes=[128, 128, 1024, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        # expected = 1 + x @ y  (ones init + matmul via atomic_add)
+        expected = torch.ones(m, n, device=DEVICE, dtype=torch.bfloat16) + (x @ y).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(result, expected, atol=0.1, rtol=0.05)
 
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""
@@ -278,6 +376,22 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.tensor([1, 0], device=DEVICE, dtype=torch.int32).repeat(10)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas(
+        "atomic scalar-origin reduction pattern is only validated on GPU backends"
+    )
+    def test_atomic_add_tile_begin_reduce_other_axis(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe regression coverage")
+        x = torch.ones((4, 4), device=DEVICE)
+        code, result = code_and_output(
+            atomic_add_tile_begin_reduce_other_axis,
+            (x,),
+            block_sizes=[2, 2],
+        )
+
+        expected = torch.tensor([4, 0, 4, 0], device=DEVICE, dtype=x.dtype)
+        torch.testing.assert_close(result, expected)
+
     @xfailIfPallas("AtomicOnDeviceTensor error message differs on Pallas")
     @skipIfRefEager("Error only raises in normal mode")
     def test_atomic_add_device_tensor_error(self):
@@ -340,6 +454,17 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_max", code)
+
+    def test_atomic_max_return_value(self):
+        x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([4, 2, 9, 1], device=DEVICE, dtype=torch.int32)
+        out = torch.empty(4, device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            atomic_max_return_kernel, (x.clone(), y, out), block_sizes=[4]
+        )
+        # Return value should be the previous values of x
+        expected = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
 
     @skipIfRocm("ROCm backend currently lacks support for these atomics")
     def test_atomic_min(self):

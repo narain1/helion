@@ -45,7 +45,7 @@ jobs:
           uv pip install -e .[docs]
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Build documentation
         run: |
@@ -60,4 +60,4 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

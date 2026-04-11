@@ -22,11 +22,14 @@ from __future__ import annotations
 
 from abc import ABC
 from abc import abstractmethod
+import csv
 from dataclasses import dataclass
 from dataclasses import field
+import importlib.util
 import json
 import logging
 from pathlib import Path
+import re
 import sys
 from typing import Any
 from typing import Literal
@@ -133,8 +136,6 @@ def generate_feature_extraction_code(feature_names: list[str]) -> str:
     Returns:
         Python code string that extracts features into local variables
     """
-    import re
-
     if not feature_names:
         return "    # No features needed"
 
@@ -588,8 +589,6 @@ def load_measurements(
     measurements_file: Path, kernel_name: str | None = None
 ) -> dict[str, ShapeConfigData]:
     """Load measurement data from CSV file."""
-    import csv
-
     if not measurements_file.exists():
         return {}
 
@@ -685,9 +684,11 @@ def _select_config_subset_single(
 
     # Find the best timing for each shape (oracle performance)
     best_per_shape = np.min(data.timings, axis=1)
+    safe_best_per_shape = best_per_shape[:, None]
 
     # Track which shapes are satisfied
     selected_indices: list[int] = []
+    selected_mask = np.zeros(n_configs, dtype=bool)
     satisfied = np.zeros(n_shapes, dtype=bool)
 
     # Current best achievable timing with selected configs
@@ -697,36 +698,29 @@ def _select_config_subset_single(
         if satisfied.all():
             break
 
-        # Score each remaining config by how many unsatisfied shapes it helps
-        best_score = -1
-        best_config_idx = -1
-
-        for config_idx in range(n_configs):
-            if config_idx in selected_indices:
-                continue
-
-            # Compute new best if we add this config
-            new_best = np.minimum(current_best, data.timings[:, config_idx])
-            slowdowns = new_best / best_per_shape
-
-            if target.goal_type == "max_slowdown":
-                score = np.sum(slowdowns <= target.threshold)
-            elif target.goal_type == "geomean_slowdown":
-                score = np.sum(
-                    np.exp(np.mean(np.log(slowdowns + 1e-10))) <= target.threshold
-                )
-            else:  # avg_slowdown
-                score = np.sum(np.mean(slowdowns) <= target.threshold)
-
-            if score > best_score:
-                best_score = score
-                best_config_idx = config_idx
-
-        if best_config_idx == -1:
+        unselected_indices = np.flatnonzero(~selected_mask)
+        if len(unselected_indices) == 0:
             break
 
+        new_best = np.minimum(current_best[:, None], data.timings)
+        slowdowns = new_best / safe_best_per_shape
+
+        if target.goal_type == "max_slowdown":
+            scores = np.sum(slowdowns <= target.threshold, axis=0)
+        elif target.goal_type == "geomean_slowdown":
+            scores = (
+                np.exp(np.mean(np.log(slowdowns + 1e-10), axis=0)) <= target.threshold
+            ).astype(np.int64)
+        else:  # avg_slowdown
+            scores = (np.mean(slowdowns, axis=0) <= target.threshold).astype(np.int64)
+
+        # Preserve the original tie-breaking behavior by taking the first
+        # unselected config with the best score in index order.
+        best_local_idx = int(np.argmax(np.asarray(scores)[unselected_indices]))
+        best_config_idx = int(unselected_indices[best_local_idx])
         selected_indices.append(best_config_idx)
-        current_best = np.minimum(current_best, data.timings[:, best_config_idx])
+        selected_mask[best_config_idx] = True
+        current_best = new_best[:, best_config_idx]
 
         # Update satisfied
         slowdowns = current_best / best_per_shape
@@ -1121,8 +1115,6 @@ def evaluate_heuristic(
 
     Returns dict mapping kernel names to performance metrics.
     """
-    import importlib.util
-
     all_data = load_measurements(measurements_file, kernel_name)
     results: dict[str, dict[str, float]] = {}
 
