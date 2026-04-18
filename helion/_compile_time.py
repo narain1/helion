@@ -109,15 +109,15 @@ class CompileTimeTracker:
             "HostFunction.lower_to_device_ir",
         ],
         "BoundKernel.set_config": [
-            "BoundKernel.to_triton_code",
+            "BoundKernel.to_code",
             "BoundKernel.PyCodeCache.load",
         ],
-        "BoundKernel.to_triton_code": [
+        "BoundKernel.to_code": [
             "BoundKernel.generate_ast",
             "BoundKernel.unparse",
         ],
         "BoundKernel.autotune": [
-            "BoundKernel.to_triton_code",
+            "BoundKernel.to_code",
             "BoundKernel.PyCodeCache.load",
         ],
     }
@@ -206,6 +206,10 @@ class CompileTimeTracker:
             f"{display_name:<50}  {elapsed:>9.3f}s  {pct:>5.1f}%  {calls:>6}",
             file=sys.stderr,
         )
+
+    def get_total_time(self) -> float:
+        """Get total top-level compile time in seconds."""
+        return sum(self._timings.get(name, 0.0) for name in self._TOP_LEVEL)
 
     def reset(self) -> None:
         """Reset all timing data."""
@@ -298,3 +302,8 @@ def print_report() -> None:
 def reset() -> None:
     """Reset all timing data."""
     get_tracker().reset()
+
+
+def get_total_time() -> float:
+    """Get total top-level compile time from the global tracker."""
+    return get_tracker().get_total_time()

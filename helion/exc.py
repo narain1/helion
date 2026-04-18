@@ -334,6 +334,10 @@ class IncorrectTileUsage(BaseError):
     message = "Tiles can only be used in tensor indexing (`x[tile]`) or in `hl.*` ops (e.g. `hl.zeros(tile)`), used in {}"
 
 
+class InvalidJaggedTileUsage(BaseError):
+    message = "Invalid usage of hl.jagged_tile: {}"
+
+
 class TileOfTile(BaseError):
     message = "Expected size arg to `hl.tile` got `Tile`, consider using `hl.tile(other_tile.begin, other_tile.end)`."
 
@@ -439,6 +443,10 @@ class TensorOperationInWrapper(BaseWarning):
         "Use @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper]) to suppress this warning.\n"
         "If this is not a tensor operation, please report this as a bug."
     )
+
+
+class ProcessGroupNameNotFound(BaseWarning):
+    message = "No process group name argument found in kernel arguments. Default to use dist.group.WORLD.group_name. This may not be the correct behavior espectially in multi-dimension parallelism. Use hl.ProcessGroupName to annotate the argument for process group name to fix the warning."
 
 
 class TensorOperationsInHostCall(TensorOperationInWrapper):
@@ -572,3 +580,7 @@ class AutodiffNotSupported(BaseError):
         "helion.backward() does not support this kernel: {0}. "
         "Only single tile loop kernels with elementwise ops are supported."
     )
+
+
+class InconsistantConfigsAcrossRanks(BaseError):
+    message = "Different ranks get different hl.Configs"

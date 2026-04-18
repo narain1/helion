@@ -13,7 +13,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -61,7 +60,6 @@ class TestViews(RefEagerTestBase, TestCase):
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
 
-    @skipIfRocm("too slow on rocm")
     def test_softmax_view_reshape(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
@@ -260,7 +258,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = input_tensor * scale_tensor[0]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("torch.addmm not supported on pallas")
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
         def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -107,9 +107,10 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
-            # Install stable 2.9 from test channel
-            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+          if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
+            VERSION="${{ matrix.pytorch-version }}"
+            VERSION="${VERSION#pytorch-}"
+            uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
@@ -119,40 +120,25 @@ jobs:
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
               uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
             fi
-            if [[ "${{ contains(matrix.alias, 'h100') }}" == "true" ]]; then
-              # Pin H100 nightly to known-good torch build to avoid inductor NameError flake.
-              uv pip install -U "torch==2.12.0.dev20260304+${{ matrix.runtime-version }}" --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
-            else
-              uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
-            fi
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
 
-      - name: Install Triton
-        if: matrix.backend == 'tileir' || (matrix.backend == 'triton' && steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+      - name: Install Triton from source
+        if: matrix.triton-pin != ''
         run: |
           set -x
           source .venv/bin/activate
           apt-get update
-          apt-get install -y git
-          apt-get install -y clang-20 clang++-20 zlib1g-dev
+          apt-get install -y git clang-20 clang++-20 zlib1g-dev
           export CC=clang-20
           export CXX=clang++-20
           mkdir -p /tmp/$USER
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true
           rm -rf triton/ || true
-          if [[ "${{ matrix.backend }}" == "tileir" ]]; then
-            git clone --recursive -b main https://github.com/triton-lang/Triton-to-tile-IR.git triton
-          else
-            git clone https://github.com/triton-lang/triton.git triton
-            if [[ "${{ contains(matrix.alias, 'h100') }}" == "true" ]]; then
-              # Pin H100 nightly to known-good Triton revision to avoid inductor NameError flake.
-              git -C triton checkout 8688c8b6
-            elif [[ "${{ matrix.python-version }}" == "3.14" ]]; then
-              # Pin Python 3.14 nightly to known-good Triton revision until backend detection is fixed upstream.
-              git -C triton checkout 77a13369
-            fi
-          fi
+          REPO="${{ matrix.triton-repo || 'https://github.com/triton-lang/triton.git' }}"
+          git clone --recursive "$REPO" triton
+          git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
@@ -182,7 +168,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.9.1' 'jaxlib==0.9.1' 'libtpu==0.0.37' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.9.2' 'jaxlib==0.9.2' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -199,12 +185,12 @@ jobs:
           TORCH_TPU_COMMIT=$(cat .github/ci_commit_pins/torch_tpu.txt)
           set +x
           gcloud secrets versions access latest \
-            --secret="torchtpu-readonly-key" \
+            --secret="torchtpu-read-key" \
             --project="ml-velocity-actions-testing" > /tmp/torch_tpu_ssh_key
           set -x
           chmod 600 /tmp/torch_tpu_ssh_key
           GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
-            git clone git@github.com:google-ml-infra/torch_tpu.git /tmp/torch_tpu
+            git clone git@github.com:google-pytorch/torch_tpu.git /tmp/torch_tpu
           rm -f /tmp/torch_tpu_ssh_key
           cd /tmp/torch_tpu
           git checkout "${TORCH_TPU_COMMIT}"
@@ -213,6 +199,9 @@ jobs:
           export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
           bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
+          # torch_tpu wheel is pinned to libtpu 0.0.38, but helion requires 0.0.40 to work
+          # we can remove this step as soon as torch_tpu updates its libtpu pin
+          uv pip install libtpu==0.0.40
           cd -
           rm -rf /tmp/torch_tpu
           # Verify
@@ -271,7 +260,7 @@ jobs:
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
-          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
+          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
           pytest $PARALLEL -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:

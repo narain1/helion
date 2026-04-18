@@ -22,12 +22,16 @@ import dataclasses
 from dataclasses import dataclass
 import functools
 import hashlib
+import importlib
+import importlib.util
+import inspect
 import json
 import logging
 import operator
 import os
 from pathlib import Path
 import sys
+import traceback
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -731,9 +735,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         Measure all known configs for the current shape.
         Returns list of (config, timing_ms) pairs.
         """
-        import tempfile
-        import traceback
-
         self.autotuner._prepare()
         kernel_name = self.kernel.kernel.name
         all_configs = self._get_all_configs_for_kernel(kernel_name)
@@ -755,17 +756,16 @@ class AOTAutotuneCache(AutotuneCacheBase):
         old_precompile = self.autotuner.settings.autotune_precompile
         self.autotuner.settings.autotune_precompile = None
 
-        # Set up tmpdir if needed (normally done inside autotune())
-        tmpdir_created = False
-        if self.autotuner._precompile_tmpdir is None:
-            self.autotuner._precompile_tmpdir = tempfile.TemporaryDirectory()
-            tmpdir_created = True
+        # Set up provider resources if needed (normally done inside autotune())
+        benchmark_provider = self.autotuner.benchmark_provider
+        benchmark_provider.setup()
 
         try:
             for i, config in enumerate(all_configs):
                 try:
                     # Benchmark this config
-                    fn, timing = self.autotuner.benchmark(config)
+                    result = self.autotuner.benchmark(config)
+                    timing = result.perf
                     if timing < float("inf"):
                         results.append((config, timing))
 
@@ -802,9 +802,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         finally:
             # Restore settings
             self.autotuner.settings.autotune_precompile = old_precompile
-            if tmpdir_created and self.autotuner._precompile_tmpdir is not None:
-                self.autotuner._precompile_tmpdir.cleanup()
-                self.autotuner._precompile_tmpdir = None
+            benchmark_provider.cleanup()
 
         print(
             f"[AOT measure] Completed: {len(results)}/{len(all_configs)} configs succeeded",
@@ -865,8 +863,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
             if heuristic_file in AOTAutotuneCache._heuristic_modules:
                 module = AOTAutotuneCache._heuristic_modules[heuristic_file]
             else:
-                import importlib.util
-
                 spec = importlib.util.spec_from_file_location(
                     "heuristic", heuristic_file
                 )
@@ -926,8 +922,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return
 
         # -- load heuristic module ------------------------------------------
-        import importlib.util
-
         if heuristic_file in AOTAutotuneCache._heuristic_modules:
             module = AOTAutotuneCache._heuristic_modules[heuristic_file]
         else:
@@ -983,8 +977,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         module: object, kernel_name: str
     ) -> list[dict[str, object]] | None:
         """Extract the ``_C`` config list from ``autotune_<kernel>``."""
-        import inspect
-
         autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
         if autotune_fn is None:
             return None
@@ -1016,7 +1008,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
             tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
+            self.kernel.kernel._base_specialization_key(self.args),
         )
 
     def _list_cache_entries(self) -> Sequence[tuple[str, LooseAutotuneCacheKey]]:
@@ -1216,8 +1208,6 @@ def _deserialize_value(val: object) -> object:
 
 def _import_type(type_name: str) -> type:
     """Import a type from its fully qualified name."""
-    import importlib
-
     parts = type_name.rsplit(".", 1)
     if len(parts) == 2:
         module_name, class_name = parts
